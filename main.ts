@@ -91,23 +91,30 @@ function requireSafe(...paths: string[]): void {
 // Matching lines at three tiers (SPEC.md section 5)
 
 const trimEndWs = (s: string): string => s.replace(/[ \t]+$/, '');
-const trimWs = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+const trimWs = (s: string): string => trimEndWs(s).replace(/^[ \t]+/, '');
 const leadWs = (s: string): string => /^[ \t]*/.exec(s)![0];
 
+/** Tier 0 compares lines as they are, tier 1 without trailing spaces/tabs, tier 2 without leading ones too. */
 const TIERS: ReadonlyArray<(s: string) => string> = [(s) => s, trimEndWs, trimWs];
 
+/** A line as the given tier compares it. */
+const normalise = (line: string, tier: number): string => TIERS[tier]!(line);
+
+/** Tier 2, the one at which N is re-indented (SPEC.md section 5). */
+const REINDENT_TIER = 2;
+
 let strictMode = false;
-const tierCount = (): number => (strictMode ? 1 : 3);
+/** `--strict` tries tier 0 alone; otherwise all three tiers. */
+const tierCount = (): number => (strictMode ? 1 : TIERS.length);
 
 /** Every position i at which `old` matches `lines` at the given tier (occurrences may overlap). */
 function occurrences(lines: string[], old: string[], tier: number, from = 0): number[] {
-  const norm = TIERS[tier]!;
-  const want = old.map(norm);
+  const want = old.map((l) => normalise(l, tier));
   const out: number[] = [];
   for (let i = Math.max(0, from); i + want.length <= lines.length; i++) {
     let ok = true;
     for (let j = 0; j < want.length; j++) {
-      if (norm(lines[i + j]!) !== want[j]) {
+      if (normalise(lines[i + j]!, tier) !== want[j]) {
         ok = false;
         break;
       }
@@ -149,7 +156,7 @@ function replacement(lines: string[], pos: number, tier: number, old: string[], 
   const patchIndent = old.length > 0 ? leadWs(old[0]!) : '';
   return neu.map((n) => {
     if (n.ctx !== null) return lines[pos + n.ctx]!;
-    if (tier === 2 && !isBlank(n.text) && n.text.startsWith(patchIndent)) {
+    if (tier === REINDENT_TIER && !isBlank(n.text) && n.text.startsWith(patchIndent)) {
       return fileIndent + n.text.slice(patchIndent.length);
     }
     return n.text;
@@ -337,6 +344,7 @@ function jsonEdit(v: unknown): Edit | null {
   }
 }
 
+/** JSON edits parser (SPEC.md section 9): one JSON array of edit objects, or JSON Lines of one object each. */
 function readJson(text: string, lines: string[]): Edit[] {
   const start = lines.findIndex((l) => !isBlank(l));
   if (start < 0) throw parseError(1);
@@ -399,21 +407,24 @@ interface Section {
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 const GIT_HEADER = /^diff --git a\/(.+?) b\/(.+)$/;
+/** `--- ` and `+++ ` are both four characters: the path is the text after them (SPEC.md section 6). */
+const FILE_HEADER_PREFIX = '--- ';
 
 /** The path of a `---` or `+++` line: up to the first tab, trimmed, without a/ or b/; null for /dev/null. */
 function headerPath(line: string): string | null {
-  let p = line.slice(4);
+  let p = line.slice(FILE_HEADER_PREFIX.length);
   const tab = p.indexOf('\t');
   if (tab >= 0) p = p.slice(0, tab);
   p = p.replace(/^ +/, '').replace(/ +$/, '');
   if (p === '/dev/null') return null;
-  if (p.startsWith('a/') || p.startsWith('b/')) p = p.slice(2);
+  if (p.startsWith('a/') || p.startsWith('b/')) p = p.slice('a/'.length);
   return p;
 }
 
 const isPairAt = (lines: string[], i: number): boolean =>
   lines[i]!.startsWith('--- ') && i + 1 < lines.length && lines[i + 1]!.startsWith('+++ ');
 
+/** Unified diff parser (SPEC.md section 6): sections, their headers and their hunks, one edit per section. */
 function parseUnified(lines: string[]): Section[] {
   const sections: Section[] = [];
   let current: Section | null = null;
@@ -439,8 +450,9 @@ function parseUnified(lines: string[]): Section[] {
       current.minus = headerPath(line);
       current.plus = headerPath(lines[i + 1]!);
       current.awaitingPair = false;
-      i += 2;
+      i += 2; // the `---` line and its `+++` line
     } else if (line.startsWith('--- ') && current !== null && inHeader) {
+      // A lone `---` in a header is an error at the line after it: 0-based i + 1, so 1-based i + 2.
       throw parseError(i + 2);
     } else if (line.startsWith('@@')) {
       const m = HUNK_HEADER.exec(line);
@@ -588,6 +600,7 @@ interface Block {
 
 const isMarker = (line: string, marker: string): boolean => line.trimEnd() === marker;
 
+/** SEARCH/REPLACE blocks parser (SPEC.md section 7): path line, SEARCH, =======, REPLACE; one edit per block. */
 function parseSearchReplace(lines: string[]): Block[] {
   const blocks: Block[] = [];
   /** Where the lines that may hold the next block's path begin. */
@@ -673,12 +686,14 @@ type V4aSection =
 
 const V4A_STARTS = ['*** Add File: ', '*** Delete File: ', '*** Update File: '] as const;
 
+/** V4A patch parser (SPEC.md section 8): Add/Delete/Update File sections between Begin and End Patch. */
 function parseV4a(lines: string[]): V4aSection[] {
   const nonBlank = lines.map((l, i) => (isBlank(l) ? -1 : i)).filter((i) => i >= 0);
   if (nonBlank.length === 0) throw parseError(1);
   const begin = nonBlank[0]!;
   const end = nonBlank[nonBlank.length - 1]!;
   if (lines[begin]!.trim() !== '*** Begin Patch') throw parseError(begin + 1);
+  // A missing End Patch is reported one past the last patch line (SPEC.md section 8).
   if (lines[end]!.trim() !== '*** End Patch' || end === begin) throw parseError(lines.length + 1);
 
   // Split the lines between the markers into sections: [header line index, body line indexes].
@@ -719,7 +734,7 @@ function parseV4a(lines: string[]): V4aSection[] {
     for (const k of body.slice(from)) {
       const b = lines[k]!;
       if (b.startsWith('@@')) {
-        const anchor = b.slice(2).trim();
+        const anchor = b.slice('@@'.length).trim();
         chunk = { anchor: anchor === '' ? null : anchor, body: [], eof: false };
         chunks.push(chunk);
       } else if (b.trimEnd() === '*** End of File') {
@@ -879,6 +894,7 @@ function run(args: string[]): { code: number; out: string[] } {
     const format = opts.format === 'auto' ? detectFormat(lines) : (opts.format as Format);
     if (format === null) throw new Stop('error: format');
     edits = readEdits(format, text, lines);
+    // A patch in which the reader finds no edit at all is `error: parse 1` (SPEC.md section 2).
     if (edits.length === 0) throw parseError(1);
   } catch (e) {
     if (e instanceof Stop) return { code: 2, out: [e.line] };
